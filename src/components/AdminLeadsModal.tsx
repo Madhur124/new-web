@@ -19,62 +19,115 @@ interface AdminLeadsModalProps {
   onClose: () => void;
 }
 
-const DEFAULT_PIN = '2026';
+const API_URL = ''; // same origin: Vite proxies /api in dev, Express serves it in production
+const TOKEN_KEY = 'pycrafters_admin_token';
 
 export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProps) {
   const [leads, setLeads] = useState<LeadRecord[]>([]);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [pinInput, setPinInput] = useState<string>('');
   const [pinError, setPinError] = useState<string>('');
+  const [loading, setLoading] = useState<boolean>(false);
+
+  const logout = () => {
+    sessionStorage.removeItem(TOKEN_KEY);
+    setIsAuthenticated(false);
+    setLeads([]);
+  };
+
+  // Fetch leads from the backend. Returns true on success.
+  const loadLeads = async (): Promise<boolean> => {
+    const token = sessionStorage.getItem(TOKEN_KEY);
+    if (!token) return false;
+
+    try {
+      setLoading(true);
+      const res = await fetch(`${API_URL}/api/leads`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 401) {
+        logout();
+        return false;
+      }
+      if (!res.ok) throw new Error('Failed to load leads');
+      setLeads(await res.json());
+      return true;
+    } catch {
+      setPinError('Could not reach the server. Please try again.');
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (isOpen) {
       setPinInput('');
       setPinError('');
-      // If already authenticated in current session, load leads
-      loadStoredLeads();
+      // If a valid session token exists, skip the PIN screen
+      loadLeads().then((ok) => setIsAuthenticated(ok));
     } else {
       setIsAuthenticated(false);
       setPinInput('');
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
-
-  const loadStoredLeads = () => {
-    try {
-      const stored = localStorage.getItem('pycrafters_leads');
-      if (stored) {
-        setLeads(JSON.parse(stored));
-      } else {
-        setLeads([]);
-      }
-    } catch {
-      setLeads([]);
-    }
-  };
 
   if (!isOpen) return null;
 
-  const handleVerifyPin = (e: React.FormEvent) => {
+  const handleVerifyPin = async (e: React.FormEvent) => {
     e.preventDefault();
     playMicroClick(1500);
+    setPinError('');
 
-    const savedPin = localStorage.getItem('pycrafters_admin_pin') || DEFAULT_PIN;
-    if (pinInput.trim() === savedPin || pinInput.trim() === 'pycrafters') {
-      setIsAuthenticated(true);
-      setPinError('');
-      loadStoredLeads();
-    } else {
-      setPinError('Incorrect PIN. Access denied.');
-      setPinInput('');
+    try {
+      setLoading(true);
+      const res = await fetch(`${API_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: pinInput.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        setPinError(data.message || 'Incorrect PIN. Access denied.');
+        setPinInput('');
+        return;
+      }
+
+      sessionStorage.setItem(TOKEN_KEY, data.token);
+      const ok = await loadLeads();
+      setIsAuthenticated(ok);
+    } catch {
+      setPinError('Could not reach the server. Please try again.');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleClearAll = () => {
-    if (confirm('Are you sure you want to permanently delete all stored leads?')) {
-      playMicroClick();
-      localStorage.removeItem('pycrafters_leads');
+  const handleClearAll = async () => {
+    if (!confirm('Are you sure you want to permanently delete all stored leads?')) return;
+    playMicroClick();
+
+    const token = sessionStorage.getItem(TOKEN_KEY);
+    try {
+      const res = await fetch(`${API_URL}/api/leads`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 401) return logout();
+      if (!res.ok) throw new Error('Delete failed');
       setLeads([]);
+    } catch {
+      alert('Could not delete leads. Please try again.');
     }
+  };
+
+  // Prevent spreadsheet formula injection (=, +, -, @ at the start of a cell)
+  const csvCell = (value: string) => {
+    let v = String(value ?? '');
+    if (/^[=+\-@\t\r]/.test(v)) v = `'${v}`;
+    return `"${v.replace(/"/g, '""')}"`;
   };
 
   const handleExportCSV = () => {
@@ -82,25 +135,29 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
     if (leads.length === 0) return;
 
     const headers = ['Code', 'Date', 'Name', 'Email', 'Company', 'Service', 'Timeline', 'Message'];
-    const rows = leads.map((l) => [
-      l.code,
-      new Date(l.timestamp).toLocaleString(),
-      `"${l.name.replace(/"/g, '""')}"`,
-      `"${l.email.replace(/"/g, '""')}"`,
-      `"${(l.company || '-').replace(/"/g, '""')}"`,
-      `"${l.service.replace(/"/g, '""')}"`,
-      `"${l.timeline.replace(/"/g, '""')}"`,
-      `"${l.message.replace(/"/g, '""')}"`,
-    ]);
+    const rows = leads.map((l) =>
+      [
+        l.code,
+        new Date(l.timestamp).toLocaleString(),
+        l.name,
+        l.email,
+        l.company || '-',
+        l.service,
+        l.timeline,
+        l.message,
+      ].map(csvCell)
+    );
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
+    const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `pycrafters_leads_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.href = url;
+    link.download = `pycrafters_leads_${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -141,7 +198,7 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
                 Pycrafters Leads Vault
               </h3>
               <p className="text-xs text-neutral-400 mt-2 font-light">
-                Encrypted database. Enter your secret PIN to access client submissions.
+                Secure database. Enter your secret PIN to access client submissions.
               </p>
             </div>
 
@@ -151,7 +208,7 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
                   type="password"
                   autoFocus
                   required
-                  maxLength={10}
+                  maxLength={32}
                   value={pinInput}
                   onChange={(e) => setPinInput(e.target.value)}
                   placeholder="••••"
@@ -167,10 +224,11 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
 
               <button
                 type="submit"
-                className="w-full py-3.5 rounded-xl bg-[#FF5500] hover:bg-[#FF661A] text-white font-semibold text-xs tracking-wider flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(255,85,0,0.35)] transition-colors"
+                disabled={loading}
+                className="w-full py-3.5 rounded-xl bg-[#FF5500] hover:bg-[#FF661A] disabled:opacity-60 text-white font-semibold text-xs tracking-wider flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(255,85,0,0.35)] transition-colors"
               >
                 <KeyRound className="w-4 h-4" />
-                <span>Unlock Leads Vault</span>
+                <span>{loading ? 'Verifying...' : 'Unlock Leads Vault'}</span>
               </button>
             </form>
           </div>
@@ -223,7 +281,9 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
 
             {/* Content Table / List */}
             <div className="overflow-y-auto pr-2 space-y-4 flex-1">
-              {leads.length === 0 ? (
+              {loading && leads.length === 0 ? (
+                <div className="text-center py-16 text-neutral-400 text-sm font-light">Loading leads...</div>
+              ) : leads.length === 0 ? (
                 <div className="text-center py-16 border border-dashed border-white/10 rounded-2xl p-8">
                   <p className="text-neutral-400 text-sm font-light">
                     Abhi tak koi form submission nahi aayi hai.
@@ -290,7 +350,9 @@ export default function AdminLeadsModal({ isOpen, onClose }: AdminLeadsModalProp
                 <Check className="w-3.5 h-3.5" />
                 PIN Verified · Session Protected
               </span>
-              <span>Owner Access Only</span>
+              <button onClick={logout} className="hover:text-white transition-colors">
+                Lock Vault
+              </button>
             </div>
           </>
         )}
